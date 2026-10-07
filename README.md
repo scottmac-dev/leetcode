@@ -7,3 +7,6 @@ efficient.
 algos/ folder are not leetcode specific but just try to implement specific
 algorithms in a leetcode style fashion, probably in a language unsupported on
 leetcode like zig or omcaml.
+
+dynamic-programming/ folder specifically for dp practice and related leetcode
+questions
