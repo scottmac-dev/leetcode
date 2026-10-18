@@ -11,6 +11,8 @@ algos/ folder are not leetcode specific but just try to implement specific
 algorithms in a leetcode style fashion, probably in a language unsupported on
 leetcode like zig or omcaml.
 
+assembly/ folder is for learning x86 assembly basics
+
 data-structures/ folder are not leetcode specific but aim to implement various
 data structures useful in software engineering
 
