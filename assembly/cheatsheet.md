@@ -74,3 +74,12 @@ _start:
     syscall
 ```
 Build: `nasm -felf64 x.asm && ld x.o -o x`
+
+## Kewords / Types
+
+|Keyword|Bytes|Bits|C type (x86-64 Linux)|Register|
+|-------|-----|----|---------------------|--------|
+|byte|  1|  8|	char|	al|
+|word|	2|	16|	short|	ax|
+|dword|	4|	32|	int	eax|
+|qword|	8|	64|	long, pointers|	rax|
