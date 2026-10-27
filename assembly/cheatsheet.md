@@ -83,3 +83,52 @@ Build: `nasm -felf64 x.asm && ld x.o -o x`
 |word|	2|	16|	short|	ax|
 |dword|	4|	32|	int	eax|
 |qword|	8|	64|	long, pointers|	rax|
+
+## Notes
+
+### Regiter 'sizing'
+rax, eax, ax, a1 are all the same physical register, just
+viewed at 64, 32, 16 and 8 bits respectively, what you use depends on the size
+of the 'word' / value you intend to put in the register. Eg. writing to eax
+zeros the upper 32 bits of rax. Writing to ax or al does not clobber upper bits. 
+
+### Hardware enforced / reserved
+- rsp (base stack pointer) is implicity used by push, pop, call and ret, you can
+  hypothetically put data in it but it would break your stack frame immediately.
+- mul/div instructions always use rdx:rax, forgetting to zero rdx can be a
+classic bug for div instructions 
+- variable shift counts must be in cl, eg `shl rax, cl`
+- string instructions (`rep movsb`, `rep stosb`) use rdi, rsi and rcx implicity
+- syscalls overwrite rcx and r11 because CPU stores the return addr and flags
+there
+
+### Conventions (ABI preferred but not hardware enforced)
+- arguements go in rdi, rsi, rdx, rcx, r8, r9
+- return values go in rax, rbx, r12-r15 and are callee saved, meaning functions
+must restore them before returning 
+- linux syscalls: 
+    - sycall number goes in rax 
+    - args go in rdi, rsi, rdx, r10, r8, r9 - r10 instead of rcx as syscall
+    clobbers rcx
+    - kernel enforces this ABI so is essentially enforced contract and mandatory
+      for linux syscalls, but not technically hardware enforced, still strict 
+- rbp = generally a frame pointer for nested stack frames
+- pure assembly not interacting with other systems or linux syscalls need not
+follow these conventions, however generally a good practice 
+
+### User free will 
+- all other non hardware enforced and non-convention recommended registers are
+fair game 
+- general best practices include:
+    - compute the value where it will be used instead of computing elsewhere and
+      moving it, less complex and more efficient 
+    - know whether a value needs to survive the call, long lived values across
+    functons should go in callee saved registers rbx, r12 - r15 to prevent
+    getting clobbered by externel code (interfaces, syscalls)
+    - short lived scratch values go in caller saced registers rax, rcx, rdx,
+    r8-r11.
+    - syscalls clobber rax, rcx, r11, everything else survives
+    - let fixed operands claim registers first and allocate moving/variable
+    values around it 
+    - use comments to document register maps for clarity
+
