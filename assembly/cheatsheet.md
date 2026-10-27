@@ -101,6 +101,21 @@ classic bug for div instructions
 - string instructions (`rep movsb`, `rep stosb`) use rdi, rsi and rcx implicity
 - syscalls overwrite rcx and r11 because CPU stores the return addr and flags
 there
+- x86-84 has 16 total general purpose registers to use, each 64 bits wide, the
+original 8 are rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp with the 8 additional r8 -
+r15 being added later. In practice you only get 15 due to rsp reserved for stack
+pointer, or 14 if following rbp frame pointer convention. 
+- There are 16 SSE/AVX vector/float registers, `xmm0-15` (128 bit) or `ymm0-15`
+  (256-bit) with AVX. AVX-512 can expand this to 32 registers `xmm0-31` and mask
+  registers `k0-k7`.
+
+### Other registers not directly expoed 
+- rip = instruction pointer, not writable directly, only jumps, calls and
+returns change it, readable via rel addressing Eg. `lea rax, [rel msg]`
+- rflags = holds conditional flags like zero, carry, sign,overflow, and is set
+by arithmetic, comparisons and conditional jumps
+- system registers for control, debug and MSR are kernel only, user space
+programs cannot touch them 
 
 ### Conventions (ABI preferred but not hardware enforced)
 - arguements go in rdi, rsi, rdx, rcx, r8, r9
@@ -115,6 +130,8 @@ must restore them before returning
 - rbp = generally a frame pointer for nested stack frames
 - pure assembly not interacting with other systems or linux syscalls need not
 follow these conventions, however generally a good practice 
+- For System V ABI floating point args go in `xmm0-7` and float return values
+come back in `xmm0`
 
 ### User free will 
 - all other non hardware enforced and non-convention recommended registers are
