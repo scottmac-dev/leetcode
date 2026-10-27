@@ -108,6 +108,19 @@ pointer, or 14 if following rbp frame pointer convention.
 - There are 16 SSE/AVX vector/float registers, `xmm0-15` (128 bit) or `ymm0-15`
   (256-bit) with AVX. AVX-512 can expand this to 32 registers `xmm0-31` and mask
   registers `k0-k7`.
+- The CPU actually has far more physical registers than this namespace and
+modern chips use renaming, so the 16 names are just labels mapped onto a larger
+hidden pool of physical registers, generally 100+ int registers and similar
+quantity of vector compliant ones. Eg. writing mov rax, 1 and later using rax
+for an unelated op may use a different physical register under the hood.
+Therefore the register namespace is a naming/labeling limit not a hardware cap.
+- All threads get their own private copy of the register namespace, with all
+processes sharing the same 16 names. The kernel saves and restores the full reg
+set each context switch. Each thread therefore sees their private owned set
+while the OS swaps between them.
+- Vector registers have wider purpose that just handling floats, also used for
+SIMD, memcpy, string scanning, hashing and crypto, so are more general purpose
+than it seems, but still more use case specific than GP registers
 
 ### Other registers not directly expoed 
 - rip = instruction pointer, not writable directly, only jumps, calls and
