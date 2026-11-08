@@ -6,11 +6,15 @@ const Order = std.math.Order;
 /// In memory BTree
 pub fn BTree(comptime K: type, comptime V: type, comptime B: usize, comptime compareFn: anytype) type {
     comptime assert(B >= 2); // BTree with node < 2 is just BST
-    const max_keys = 2 * B - 1;
+    const max_keys = 2 * B - 1; // 2B - 1 , ensures always a median split node
+    const max_children = max_keys + 1; // Always extra child pointer, eg. * K * K *
+    const median = B - 1;
+    const min_keys = median;
+    const Len = u16;
+    comptime assert(max_children <= std.math.maxInt(Len)); // children index = len + 1 must fit
 
     return struct {
         const Self = @This();
-        const Len = std.math.IntFittingRange(0, max_keys);
 
         // Allow for compareFn to be fn (anytype, anytype) anytype
         // which allows the convenient use of std.math.order.
@@ -31,6 +35,10 @@ pub fn BTree(comptime K: type, comptime V: type, comptime B: usize, comptime com
             len: Len = 0,
             keys: [max_keys]K = undefined,
             values: [max_keys]V = undefined,
+
+            pub fn isFull(self: *Leaf) bool {
+                return self.len == max_keys;
+            }
         };
 
         /// Embeds a leaf nodes data and points at children nodes, used for mid tree nodes so not all
@@ -42,7 +50,7 @@ pub fn BTree(comptime K: type, comptime V: type, comptime B: usize, comptime com
             children: [max_keys + 1]*Leaf = undefined,
 
             fn cast(leaf: *Leaf) *Internal {
-                return @fieldParentPtr("data", leaf);
+                return @alignCast(@fieldParentPtr("data", leaf));
             }
         };
 
@@ -81,7 +89,7 @@ pub fn BTree(comptime K: type, comptime V: type, comptime B: usize, comptime com
         /// Allocates and returns Internal pointer
         fn createInternal(alloc: Allocator) Allocator.Error!*Internal {
             const n = try alloc.create(Internal);
-            n.* = .{}; // initialize
+            n.* = .{ .data = .{} }; // initialize
             return n;
         }
 
@@ -136,20 +144,126 @@ pub fn BTree(comptime K: type, comptime V: type, comptime B: usize, comptime com
         }
 
         /// When parent is a internal node and children is full
-        fn splitChild(alloc: Allocator, parent: *Internal, idx: usize, child_h: u32) Allocator.Error!void {}
+        /// A full node holds at most 2B - 1 keys, its middle (median) node is index B - 1
+        /// Top down splitting strategy - when a child is full split it before going down to it on insert
+        ///     - results in single pass insert, nodes split on way down to find insert pos
+        ///     - when reaching a leaf that has room, insert always succeeds no backtracking
+        ///     - when splitting child, its parent has room for the median guaranteed
+        ///     - full nodes cannot take another key, cut it in half and middle key moves up to parent,
+        ///     becoming the separator between the halves, * M *
+        fn splitChild(alloc: Allocator, parent: *Internal, idx: usize, child_h: u32) Allocator.Error!void {
+            const child_n = parent.children[idx]; // becomes lhs node
+            assert(child_n.len == max_keys); // only split full nodes
+            assert(parent.data.len < max_keys); // top down split assumes room in parent to push up
+
+            // Allocate rhs node first, if alloc fails tree does not change
+            const rhs: *Leaf = if (child_h == 0) blk: {
+                // Is leaf
+                const leaf = try createLeaf(alloc);
+                break :blk leaf;
+            } else blk: {
+                // Is internal
+                const internal = try createInternal(alloc);
+                break :blk &internal.data;
+            };
+
+            // Top half keys/values moves to rhs node
+            @memcpy(rhs.keys[0 .. B - 1], child_n.keys[B..max_keys]);
+            @memcpy(rhs.values[0 .. B - 1], child_n.values[B..max_keys]);
+
+            // For internal nodes, top half of children pointers adopted by rhs node
+            if (child_h > 0) {
+                @memcpy(
+                    Internal.cast(rhs).children[0..B],
+                    Internal.cast(child_n).children[B..max_children],
+                );
+            }
+
+            // Save median value to push to parent, shrink split halves
+            const mid_key = child_n.keys[median];
+            const mid_val = child_n.values[median];
+            child_n.len = min_keys;
+            rhs.len = min_keys;
+
+            // Make room for new child pointer at idx + 1 in parent
+            // Pushing up the median means there is also an additional child
+            const p_len = parent.data.len;
+            @memmove(
+                parent.children[idx + 2 .. p_len + 2],
+                parent.children[idx + 1 .. p_len + 1], // shift idx + 1.. right
+            );
+            parent.children[idx + 1] = rhs; // insert rhs, original child_n is still lhs
+
+            // Push up median value to parent, insertAt handles key/value shift and len bump
+            insertAt(&parent.data, idx, mid_key, mid_val);
+        }
 
         /// Put used to insert new KV into BTree, split nodes when full
-        pub fn put(self: *Self, alloc: Allocator, key: K, value: V) Allocator.Error!void {}
+        pub fn put(self: *Self, alloc: Allocator, key: K, value: V) Allocator.Error!void {
+            // Empty tree: root is a single leaf
+            const root = self.root orelse {
+                const leaf = try createLeaf(alloc);
+                insertAt(leaf, 0, key, value);
+                self.root = leaf;
+                self.len = 1;
+                return;
+            };
+
+            // Root is full: grow a new root above it (the only way height increases at this stage)
+            if (root.isFull()) {
+                const new_root = try createInternal(alloc);
+                errdefer alloc.destroy(new_root);
+                new_root.children[0] = root;
+                try splitChild(alloc, new_root, 0, self.height);
+                // Only commit once the split succeeded
+                self.root = &new_root.data;
+                self.height += 1;
+            }
+
+            // Top down descend, splitting full children before entering
+            var node = self.root.?; // assumed safe by this point
+            var h = self.height;
+            while (true) {
+                const r = searchNode(node, key);
+                if (r.found) {
+                    node.values[r.idx] = value; // unique keys, reassign value only
+                    return;
+                }
+                if (h == 0) {
+                    // Is leaf
+                    insertAt(node, r.idx, key, value); // room guaranteed, split on descend
+                    self.len += 1;
+                    return;
+                }
+
+                const parent = Internal.cast(node);
+                var idx = r.idx;
+                if (parent.children[idx].isFull()) {
+                    try splitChild(alloc, parent, idx, h - 1);
+                    // Median sits at node.keys[idx], determine side base on comparison
+                    switch (compare(key, node.keys[idx])) {
+                        .eq => {
+                            node.values[idx] = value; // match on promoted key, reassign val
+                            return;
+                        },
+                        .gt => idx += 1, // rhs
+                        .lt => {}, // idx already equals lhs
+                    }
+                }
+                node = parent.children[idx]; // descend
+                h -= 1;
+            }
+        }
     };
 }
 
 /// TESTING
 const testing = std.testing;
 
-// test "put/get ascending, B=2" {
-//     var t: BTree(u32, u32, 2, std.math.order) = .{};
-//     defer t.deinit(std.testing.allocator);
-//     for (0..1000) |i| try t.put(std.testing.allocator, @intCast(i), @intCast(i * 10));
-//     for (0..1000) |i| try std.testing.expectEqual(@as(?u32, @intCast(i * 10)), t.get(@intCast(i)));
-//     try std.testing.expectEqual(@as(?u32, null), t.get(5000));
-// }
+test "put/get ascending, B=2" {
+    var t: BTree(u32, u32, 2, std.math.order) = .{};
+    defer t.deinit(std.testing.allocator);
+    for (0..1000) |i| try t.put(std.testing.allocator, @intCast(i), @intCast(i * 10));
+    for (0..1000) |i| try std.testing.expectEqual(@as(?u32, @intCast(i * 10)), t.get(@intCast(i)));
+    try std.testing.expectEqual(@as(?u32, null), t.get(5000));
+}
