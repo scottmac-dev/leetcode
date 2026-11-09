@@ -70,6 +70,25 @@ pub fn BTree(comptime K: type, comptime V: type, comptime B: usize, comptime com
             }
         };
 
+        /// Result from getOrPut function
+        pub const GetOrPutResult = struct {
+            key_ptr: *const K,
+            val_ptr: *V,
+            found_existing: bool,
+        };
+
+        /// Result from a searchNode function
+        pub const SearchNodeResult = struct {
+            idx: usize,
+            found: bool,
+        };
+
+        /// Pairs key and value as a single return shape
+        pub const KV = struct {
+            key: K,
+            val: V,
+        };
+
         // --- Life cycle
 
         /// Public API for total KV pairs
@@ -117,7 +136,7 @@ pub fn BTree(comptime K: type, comptime V: type, comptime B: usize, comptime com
         // --- Search and retrieve
 
         /// Search a node to identify key position relative to stored keys
-        fn searchNode(node: *const Leaf, key: K) struct { idx: usize, found: bool } {
+        fn searchNode(node: *const Leaf, key: K) SearchNodeResult {
             for (node.keys[0..node.len], 0..) |k, i| {
                 switch (compare(key, k)) {
                     .lt => return .{ .idx = i, .found = false }, // less than, search lhs
@@ -149,59 +168,6 @@ pub fn BTree(comptime K: type, comptime V: type, comptime B: usize, comptime com
         /// Walk Btree and return value if found, else null
         pub fn get(self: *const Self, key: K) ?V {
             return if (self.getPtr(key)) |p| p.* else null;
-        }
-
-        /// Validates that:
-        /// - Empty tree has len = 0 and height = 0
-        /// - Non empty tree has len > 0
-        /// - Tree length = sum of all KV pairs
-        /// - Root node not empty if initialized
-        fn validate(self: *const Self) ValidationError!void {
-            const node = self.root orelse {
-                if (self.height > 0 or self.len > 0) return error.CountMismatch;
-                return;
-            };
-            if (node.len == 0) return error.EmptyRoot;
-            if (self.len != try validateNode(node, self.height, true, null, null)) return error.CountMismatch;
-        }
-
-        /// Helper to recursively sum children nodes during validation
-        /// Each node is validates such that:
-        /// - Has at most max_keys keys
-        /// - Non root nodes have atleast min_keys
-        /// - Keys are incresing according to compare logic
-        /// - Every key lies strictly within (lo, hi) inherited from ancestors, AKA. all nodes sorted
-        fn validateNode(node: *const Leaf, h: u32, is_root: bool, lo: ?K, hi: ?K) ValidationError!usize {
-
-            // Length and size checks
-            const n_keys: usize = node.len;
-            if (n_keys > max_keys) return error.NodeOverfull;
-            if (!is_root and n_keys < min_keys) return error.NodeUnderfull;
-
-            // Keys sorted within node, and within bounds from ancestors
-            for (node.keys[0..n_keys], 0..) |key, i| {
-                if (i > 0 and compare(node.keys[i - 1], key) != .lt) return error.KeysNotSorted;
-                if (lo) |l| {
-                    if (compare(l, key) != .lt) return error.KeyOutOfBounds;
-                }
-                if (hi) |u| {
-                    if (compare(key, u) != .lt) return error.KeyOutOfBounds;
-                }
-            }
-
-            var total_kv_pairs: usize = n_keys;
-            if (h != 0) {
-                // Is Internal, recurse children with tightened bounds and sum their KV pairs
-                const internal = Internal.castConst(node);
-
-                // node.len is slots used, children.len could be unused capacity
-                for (internal.children[0 .. n_keys + 1], 0..) |child, i| {
-                    const c_lo = if (i == 0) lo else node.keys[i - 1];
-                    const c_hi = if (i == n_keys) hi else node.keys[i];
-                    total_kv_pairs += try validateNode(child, h - 1, false, c_lo, c_hi);
-                }
-            }
-            return total_kv_pairs;
         }
 
         // --- Insert
@@ -277,15 +243,18 @@ pub fn BTree(comptime K: type, comptime V: type, comptime B: usize, comptime com
             insertAt(&parent.data, idx, mid_key, mid_val);
         }
 
-        /// Put used to insert new KV into BTree, split nodes when full
-        pub fn put(self: *Self, alloc: Allocator, key: K, value: V) Allocator.Error!void {
+        /// Finds `key`, inserting it if missing. When `found_existing` is false the
+        /// value is undefined and must be written by the caller via `value_ptr`.
+        /// Returned pointers are invalidated by the next mutation of the tree.
+        pub fn getOrPut(self: *Self, alloc: Allocator, key: K) Allocator.Error!GetOrPutResult {
+
             // Empty tree: root is a single leaf
             const root = self.root orelse {
                 const leaf = try createLeaf(alloc);
-                insertAt(leaf, 0, key, value);
+                insertAt(leaf, 0, key, undefined);
                 self.root = leaf;
                 self.len = 1;
-                return;
+                return .{ .key_ptr = &leaf.keys[0], .val_ptr = &leaf.values[0], .found_existing = false };
             };
 
             // Root is full: grow a new root above it (the only way height increases at this stage)
@@ -305,26 +274,23 @@ pub fn BTree(comptime K: type, comptime V: type, comptime B: usize, comptime com
             while (true) {
                 const r = searchNode(node, key);
                 if (r.found) {
-                    node.values[r.idx] = value; // unique keys, reassign value only
-                    return;
+                    return .{ .key_ptr = &node.keys[r.idx], .val_ptr = &node.values[r.idx], .found_existing = true };
                 }
                 if (h == 0) {
-                    // Is leaf
-                    insertAt(node, r.idx, key, value); // room guaranteed, split on descend
+                    // Leaf, not found: insert key now, value left for the caller
+                    insertAt(node, r.idx, key, undefined);
                     self.len += 1;
-                    return;
+                    return .{ .key_ptr = &node.keys[r.idx], .val_ptr = &node.values[r.idx], .found_existing = false };
                 }
 
+                // Is Internal, assumed by this point
                 const parent = Internal.cast(node);
                 var idx = r.idx;
                 if (parent.children[idx].isFull()) {
                     try splitChild(alloc, parent, idx, h - 1);
                     // Median sits at node.keys[idx], determine side base on comparison
                     switch (compare(key, node.keys[idx])) {
-                        .eq => {
-                            node.values[idx] = value; // match on promoted key, reassign val
-                            return;
-                        },
+                        .eq => return .{ .key_ptr = &node.keys[r.idx], .val_ptr = &node.values[r.idx], .found_existing = true },
                         .gt => idx += 1, // rhs
                         .lt => {}, // idx already equals lhs
                     }
@@ -332,6 +298,75 @@ pub fn BTree(comptime K: type, comptime V: type, comptime B: usize, comptime com
                 node = parent.children[idx]; // descend
                 h -= 1;
             }
+        }
+
+        /// Insert or overwrite key with value, returning old key value pair if found existing
+        pub fn fetchPut(self: *Self, alloc: Allocator, key: K, value: V) Allocator.Error!?KV {
+            const res = try self.getOrPut(alloc, key);
+            const old: ?KV = if (res.found_existing) .{ .key = res.key_ptr.*, .val = res.val_ptr.* } else null;
+            res.value_ptr.* = value;
+            return old;
+        }
+
+        /// Insert or overwrite `key` with `value`
+        pub fn put(self: *Self, alloc: Allocator, key: K, value: V) Allocator.Error!void {
+            const res = try self.getOrPut(alloc, key);
+            res.val_ptr.* = value;
+        }
+
+        // -- Validation and correctness helpers
+
+        /// Validates that:
+        /// - Empty tree has len = 0 and height = 0
+        /// - Non empty tree has len > 0
+        /// - Tree length = sum of all KV pairs
+        /// - Root node not empty if initialized
+        fn validate(self: *const Self) ValidationError!void {
+            const node = self.root orelse {
+                if (self.height > 0 or self.len > 0) return error.CountMismatch;
+                return;
+            };
+            if (node.len == 0) return error.EmptyRoot;
+            if (self.len != try validateNode(node, self.height, true, null, null)) return error.CountMismatch;
+        }
+
+        /// Helper to recursively sum children nodes during validation
+        /// Each node is validates such that:
+        /// - Has at most max_keys keys
+        /// - Non root nodes have atleast min_keys
+        /// - Keys are incresing according to compare logic
+        /// - Every key lies strictly within (lo, hi) inherited from ancestors, AKA. all nodes sorted
+        fn validateNode(node: *const Leaf, h: u32, is_root: bool, lo: ?K, hi: ?K) ValidationError!usize {
+
+            // Length and size checks
+            const n_keys: usize = node.len;
+            if (n_keys > max_keys) return error.NodeOverfull;
+            if (!is_root and n_keys < min_keys) return error.NodeUnderfull;
+
+            // Keys sorted within node, and within bounds from ancestors
+            for (node.keys[0..n_keys], 0..) |key, i| {
+                if (i > 0 and compare(node.keys[i - 1], key) != .lt) return error.KeysNotSorted;
+                if (lo) |l| {
+                    if (compare(l, key) != .lt) return error.KeyOutOfBounds;
+                }
+                if (hi) |u| {
+                    if (compare(key, u) != .lt) return error.KeyOutOfBounds;
+                }
+            }
+
+            var total_kv_pairs: usize = n_keys;
+            if (h != 0) {
+                // Is Internal, recurse children with tightened bounds and sum their KV pairs
+                const internal = Internal.castConst(node);
+
+                // node.len is slots used, children.len could be unused capacity
+                for (internal.children[0 .. n_keys + 1], 0..) |child, i| {
+                    const c_lo = if (i == 0) lo else node.keys[i - 1];
+                    const c_hi = if (i == n_keys) hi else node.keys[i];
+                    total_kv_pairs += try validateNode(child, h - 1, false, c_lo, c_hi);
+                }
+            }
+            return total_kv_pairs;
         }
     };
 }
