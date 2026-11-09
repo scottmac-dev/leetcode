@@ -89,6 +89,12 @@ pub fn BTree(comptime K: type, comptime V: type, comptime B: usize, comptime com
             val: V,
         };
 
+        /// Pointers to a key and value stored in the tree, invalidated by the next mutation
+        pub const Entry = struct {
+            key_ptr: *const K,
+            val_ptr: *V,
+        };
+
         // --- Life cycle
 
         /// Public API for total KV pairs
@@ -170,6 +176,121 @@ pub fn BTree(comptime K: type, comptime V: type, comptime B: usize, comptime com
             return if (self.getPtr(key)) |p| p.* else null;
         }
 
+        /// Entry with the smallest key, null if empty
+        pub fn min(self: *const Self) ?Entry {
+            var node = self.root orelse return null;
+            var h = self.height;
+            while (h > 0) : (h -= 1) node = Internal.cast(node).children[0]; // leftmost path
+            return .{ .key_ptr = &node.keys[0], .val_ptr = &node.values[0] };
+        }
+
+        /// Entry with the largest key, null if empty
+        pub fn max(self: *const Self) ?Entry {
+            var node = self.root orelse return null;
+            var h = self.height;
+            while (h > 0) : (h -= 1) node = Internal.cast(node).children[node.len]; // rightmost path
+            const i = node.len - 1;
+            return .{ .key_ptr = &node.keys[i], .val_ptr = &node.values[i] };
+        }
+
+        // --- Iteration
+
+        /// Deepest path the iterator can record. Every level multiplies the node count by at least
+        /// B >= 2, so a tree this deep would need over 2^63 nodes, unreachable in practice
+        const max_depth = 64;
+
+        /// In order iterator, holds the path from the root to the current position as a stack of
+        /// (node, idx) frames, with no allocation:
+        ///     - top frame: idx of the next key to yield from that node
+        ///     - ancestor frames: idx of the child descended into, which is also the idx of the
+        ///       key that follows that child's subtree, * K0 * K1 * ..
+        /// Invalidated by any mutation of the tree.
+        pub const Iterator = struct {
+            const Frame = struct { node: *Leaf, idx: Len };
+
+            stack: [max_depth]Frame = undefined,
+            depth: u8 = 0, // frames in use, 0 => exhausted
+            height: u32 = 0, // tree height, the frame at level == height is a leaf
+
+            /// Next entry in sorted key order, null when exhausted
+            pub fn next(it: *Iterator) ?Entry {
+                while (it.depth > 0) {
+                    const level = it.depth - 1;
+                    const top = &it.stack[level];
+                    if (top.idx < top.node.len) {
+                        const i = top.idx;
+                        top.idx += 1;
+                        // Internal: the subtree right of key i comes before key i + 1, queue it up
+                        if (level < it.height) it.pushLeftmost(Internal.cast(top.node).children[top.idx]);
+                        return .{ .key_ptr = &top.node.keys[i], .val_ptr = &top.node.values[i] };
+                    }
+                    it.depth -= 1; // node exhausted, resume at the parent's next key
+                }
+                return null;
+            }
+
+            fn push(it: *Iterator, node: *Leaf, idx: usize) void {
+                assert(it.depth < max_depth);
+                it.stack[it.depth] = .{ .node = node, .idx = @intCast(idx) };
+                it.depth += 1;
+            }
+
+            /// Push `start` then follow its leftmost children down to a leaf
+            fn pushLeftmost(it: *Iterator, start: *Leaf) void {
+                var node = start;
+                while (true) {
+                    it.push(node, 0);
+                    if (it.depth - 1 == it.height) return; // leaf level reached
+                    node = Internal.cast(node).children[0];
+                }
+            }
+        };
+
+        fn emptyIterator(self: *const Self) Iterator {
+            assert(self.height < max_depth);
+            return .{ .height = self.height };
+        }
+
+        /// Iterator over every entry in sorted key order
+        pub fn iterator(self: *const Self) Iterator {
+            var it = self.emptyIterator();
+            if (self.root) |r| it.pushLeftmost(r);
+            return it;
+        }
+
+        /// Iterator starting at the first entry with key >= `key`
+        pub fn lowerBound(self: *const Self, key: K) Iterator {
+            return self.seek(key, .lower);
+        }
+
+        /// Iterator starting at the first entry with key > `key`
+        pub fn upperBound(self: *const Self, key: K) Iterator {
+            return self.seek(key, .upper);
+        }
+
+        /// Descend towards `key` recording the path, so the iterator resumes at the first key that is
+        /// >= `key` (lower) or > `key` (upper). A leaf frame left with idx == len is popped by next(),
+        /// which then resumes at the ancestor key following that subtree.
+        fn seek(self: *const Self, key: K, comptime bound: enum { lower, upper }) Iterator {
+            var it = self.emptyIterator();
+            var node = self.root orelse return it;
+            var h = self.height;
+            while (true) {
+                const r = searchNode(node, key);
+                // Exact match: lower starts on it, upper starts just after it
+                const idx = if (r.found and bound == .upper) r.idx + 1 else r.idx;
+                it.push(node, idx);
+                if (h == 0) return it;
+                if (r.found) {
+                    // upper on an internal node: successor is the leftmost key of the right child
+                    if (bound == .upper) it.pushLeftmost(Internal.cast(node).children[idx]);
+                    return it;
+                }
+                node = Internal.cast(node).children[idx]; // descend
+                h -= 1;
+            }
+        }
+
         // --- Insert
 
         /// Puts a key and value into a node that is not full at pos idx
@@ -244,7 +365,7 @@ pub fn BTree(comptime K: type, comptime V: type, comptime B: usize, comptime com
         }
 
         /// Finds `key`, inserting it if missing. When `found_existing` is false the
-        /// value is undefined and must be written by the caller via `value_ptr`.
+        /// value is undefined and must be written by the caller via `val_ptr`.
         /// Returned pointers are invalidated by the next mutation of the tree.
         pub fn getOrPut(self: *Self, alloc: Allocator, key: K) Allocator.Error!GetOrPutResult {
 
@@ -304,7 +425,7 @@ pub fn BTree(comptime K: type, comptime V: type, comptime B: usize, comptime com
         pub fn fetchPut(self: *Self, alloc: Allocator, key: K, value: V) Allocator.Error!?KV {
             const res = try self.getOrPut(alloc, key);
             const old: ?KV = if (res.found_existing) .{ .key = res.key_ptr.*, .val = res.val_ptr.* } else null;
-            res.value_ptr.* = value;
+            res.val_ptr.* = value;
             return old;
         }
 
@@ -431,4 +552,127 @@ test "missing keys return null" {
     defer t.deinit(testing.allocator);
     for (0..100) |i| try t.put(testing.allocator, @intCast(i * 2), 0); // evens only
     for (0..100) |i| try testing.expect(!t.contains(@intCast(i * 2 + 1))); // odds absent
+}
+
+/// Drain `it`, expecting even keys first, first + 2, .., last (value = key * 10), or nothing if `first` is null
+fn expectRun(it: anytype, first: ?u32, last: u32) !void {
+    var want = first;
+    while (it.next()) |e| {
+        try testing.expect(want != null);
+        try testing.expectEqual(want.?, e.key_ptr.*);
+        try testing.expectEqual(want.? * 10, e.val_ptr.*);
+        want = if (want.? == last) null else want.? + 2;
+    }
+    try testing.expectEqual(@as(?u32, null), want);
+}
+
+/// Even keys 10..1008 inserted shuffled, then check full iteration, min/max and every bound query
+fn checkOrdered(comptime b: usize) !void {
+    const T = BTree(u32, u32, b, std.math.order);
+    var t: T = .empty;
+    defer t.deinit(testing.allocator);
+
+    const lo = 10;
+    const hi = 1008;
+    var keys: [500]u32 = undefined;
+    for (&keys, 0..) |*k, i| k.* = @intCast(lo + i * 2);
+    var prng = std.Random.DefaultPrng.init(b);
+    prng.random().shuffle(u32, &keys);
+    for (keys) |k| try t.put(testing.allocator, k, k * 10);
+    try t.validate();
+
+    var all = t.iterator();
+    try expectRun(&all, lo, hi);
+
+    try testing.expectEqual(@as(u32, lo), t.min().?.key_ptr.*);
+    try testing.expectEqual(@as(u32, hi), t.max().?.key_ptr.*);
+
+    // Queries below, between, on and above the stored keys
+    var q: u32 = 0;
+    while (q <= hi + 5) : (q += 1) {
+        const ge: u32 = if (q < lo) lo else if (q % 2 == 0) q else q + 1;
+        const gt: u32 = if (q < lo) lo else if (q % 2 == 0) q + 2 else q + 1;
+        var lb = t.lowerBound(q);
+        try expectRun(&lb, if (ge <= hi) ge else null, hi);
+        var ub = t.upperBound(q);
+        try expectRun(&ub, if (gt <= hi) gt else null, hi);
+    }
+}
+
+test "iterator, bounds and min/max across node sizes" {
+    try checkOrdered(2);
+    try checkOrdered(3);
+    try checkOrdered(16);
+}
+
+test "iteration on empty tree" {
+    var t: Tree = .empty;
+    defer t.deinit(testing.allocator);
+    var it = t.iterator();
+    try testing.expect(it.next() == null);
+    var lb = t.lowerBound(5);
+    try testing.expect(lb.next() == null);
+    var ub = t.upperBound(5);
+    try testing.expect(ub.next() == null);
+    try testing.expect(t.min() == null);
+    try testing.expect(t.max() == null);
+}
+
+test "range query [lo, hi)" {
+    var t: Tree = .empty;
+    defer t.deinit(testing.allocator);
+    for (0..1000) |i| try t.put(testing.allocator, @intCast(i), 1);
+
+    var sum: u32 = 0;
+    var n: u32 = 0;
+    var it = t.lowerBound(250);
+    while (it.next()) |e| {
+        if (e.key_ptr.* >= 750) break;
+        sum += e.key_ptr.*;
+        n += 1;
+    }
+    try testing.expectEqual(@as(u32, 500), n);
+    try testing.expectEqual(@as(u32, (250 + 749) * 500 / 2), sum);
+}
+
+test "iterator values are mutable in place" {
+    var t: Tree = .empty;
+    defer t.deinit(testing.allocator);
+    for (0..100) |i| try t.put(testing.allocator, @intCast(i), 0);
+    var it = t.iterator();
+    while (it.next()) |e| e.val_ptr.* = e.key_ptr.* + 1;
+    for (0..100) |i| try testing.expectEqual(@as(?u32, @intCast(i + 1)), t.get(@intCast(i)));
+}
+
+fn strOrder(a: []const u8, b: []const u8) Order {
+    return std.mem.order(u8, a, b);
+}
+
+test "iterator frees owned keys" {
+    const StrTree = BTree([]const u8, u32, 2, strOrder);
+    const alloc = testing.allocator;
+    var t: StrTree = .empty;
+    defer t.deinit(alloc);
+
+    for (0..200) |i| {
+        const key = try std.fmt.allocPrint(alloc, "key-{d:0>4}", .{i});
+        try t.put(alloc, key, @intCast(i));
+    }
+    try testing.expectEqualStrings("key-0000", t.min().?.key_ptr.*);
+    try testing.expectEqualStrings("key-0199", t.max().?.key_ptr.*);
+
+    // testing.allocator fails the test if any key leaks
+    var it = t.iterator();
+    while (it.next()) |e| alloc.free(e.key_ptr.*);
+}
+
+test "fetchPut returns previous pair" {
+    var t: Tree = .empty;
+    defer t.deinit(testing.allocator);
+    try testing.expectEqual(@as(?Tree.KV, null), try t.fetchPut(testing.allocator, 7, 70));
+    const old = (try t.fetchPut(testing.allocator, 7, 71)).?;
+    try testing.expectEqual(@as(u32, 7), old.key);
+    try testing.expectEqual(@as(u32, 70), old.val);
+    try testing.expectEqual(@as(?u32, 71), t.get(7));
+    try testing.expectEqual(@as(usize, 1), t.count());
 }
