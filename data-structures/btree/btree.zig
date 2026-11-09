@@ -3,6 +3,16 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const Order = std.math.Order;
 
+/// Various types of invalid tree state to check
+const ValidationError = error{
+    EmptyRoot,
+    CountMismatch,
+    NodeOverfull,
+    NodeUnderfull,
+    KeysNotSorted,
+    KeyOutOfBounds,
+};
+
 /// In memory BTree
 pub fn BTree(comptime K: type, comptime V: type, comptime B: usize, comptime compareFn: anytype) type {
     comptime assert(B >= 2); // BTree with node < 2 is just BST
@@ -15,6 +25,7 @@ pub fn BTree(comptime K: type, comptime V: type, comptime B: usize, comptime com
 
     return struct {
         const Self = @This();
+        pub const empty: Self = .{};
 
         // Allow for compareFn to be fn (anytype, anytype) anytype
         // which allows the convenient use of std.math.order.
@@ -36,7 +47,7 @@ pub fn BTree(comptime K: type, comptime V: type, comptime B: usize, comptime com
             keys: [max_keys]K = undefined,
             values: [max_keys]V = undefined,
 
-            pub fn isFull(self: *Leaf) bool {
+            pub fn isFull(self: *const Leaf) bool {
                 return self.len == max_keys;
             }
         };
@@ -49,12 +60,22 @@ pub fn BTree(comptime K: type, comptime V: type, comptime B: usize, comptime com
             // * L * L *
             children: [max_keys + 1]*Leaf = undefined,
 
+            /// Casting between Leaf and Internal node so data and additional pointers not always needed
             fn cast(leaf: *Leaf) *Internal {
+                return @alignCast(@fieldParentPtr("data", leaf));
+            }
+
+            fn castConst(leaf: *const Leaf) *const Internal {
                 return @alignCast(@fieldParentPtr("data", leaf));
             }
         };
 
         // --- Life cycle
+
+        /// Public API for total KV pairs
+        pub fn count(self: *const Self) usize {
+            return self.len;
+        }
 
         /// Recursively free all nodes
         pub fn deinit(self: *Self, alloc: Allocator) void {
@@ -107,6 +128,11 @@ pub fn BTree(comptime K: type, comptime V: type, comptime B: usize, comptime com
             return .{ .idx = node.len, .found = false }; // exhausted keys, search rhs
         }
 
+        /// Public API for does btree contain a key
+        pub fn contains(self: *const Self, key: K) bool {
+            return self.getPtr(key) != null;
+        }
+
         /// Return a value as a pointer given key, null if not found
         pub fn getPtr(self: *const Self, key: K) ?*V {
             var node = self.root orelse return null; // empty BTree
@@ -121,8 +147,61 @@ pub fn BTree(comptime K: type, comptime V: type, comptime B: usize, comptime com
         }
 
         /// Walk Btree and return value if found, else null
-        pub fn get(self: *Self, key: K) ?V {
+        pub fn get(self: *const Self, key: K) ?V {
             return if (self.getPtr(key)) |p| p.* else null;
+        }
+
+        /// Validates that:
+        /// - Empty tree has len = 0 and height = 0
+        /// - Non empty tree has len > 0
+        /// - Tree length = sum of all KV pairs
+        /// - Root node not empty if initialized
+        fn validate(self: *const Self) ValidationError!void {
+            const node = self.root orelse {
+                if (self.height > 0 or self.len > 0) return error.CountMismatch;
+                return;
+            };
+            if (node.len == 0) return error.EmptyRoot;
+            if (self.len != try validateNode(node, self.height, true, null, null)) return error.CountMismatch;
+        }
+
+        /// Helper to recursively sum children nodes during validation
+        /// Each node is validates such that:
+        /// - Has at most max_keys keys
+        /// - Non root nodes have atleast min_keys
+        /// - Keys are incresing according to compare logic
+        /// - Every key lies strictly within (lo, hi) inherited from ancestors, AKA. all nodes sorted
+        fn validateNode(node: *const Leaf, h: u32, is_root: bool, lo: ?K, hi: ?K) ValidationError!usize {
+
+            // Length and size checks
+            const n_keys: usize = node.len;
+            if (n_keys > max_keys) return error.NodeOverfull;
+            if (!is_root and n_keys < min_keys) return error.NodeUnderfull;
+
+            // Keys sorted within node, and within bounds from ancestors
+            for (node.keys[0..n_keys], 0..) |key, i| {
+                if (i > 0 and compare(node.keys[i - 1], key) != .lt) return error.KeysNotSorted;
+                if (lo) |l| {
+                    if (compare(l, key) != .lt) return error.KeyOutOfBounds;
+                }
+                if (hi) |u| {
+                    if (compare(key, u) != .lt) return error.KeyOutOfBounds;
+                }
+            }
+
+            var total_kv_pairs: usize = n_keys;
+            if (h != 0) {
+                // Is Internal, recurse children with tightened bounds and sum their KV pairs
+                const internal = Internal.castConst(node);
+
+                // node.len is slots used, children.len could be unused capacity
+                for (internal.children[0 .. n_keys + 1], 0..) |child, i| {
+                    const c_lo = if (i == 0) lo else node.keys[i - 1];
+                    const c_hi = if (i == n_keys) hi else node.keys[i];
+                    total_kv_pairs += try validateNode(child, h - 1, false, c_lo, c_hi);
+                }
+            }
+            return total_kv_pairs;
         }
 
         // --- Insert
@@ -257,13 +336,64 @@ pub fn BTree(comptime K: type, comptime V: type, comptime B: usize, comptime com
     };
 }
 
-/// TESTING
+// --- TESTING
 const testing = std.testing;
+const Tree = BTree(u32, u32, 2, std.math.order);
 
-test "put/get ascending, B=2" {
-    var t: BTree(u32, u32, 2, std.math.order) = .{};
-    defer t.deinit(std.testing.allocator);
-    for (0..1000) |i| try t.put(std.testing.allocator, @intCast(i), @intCast(i * 10));
-    for (0..1000) |i| try std.testing.expectEqual(@as(?u32, @intCast(i * 10)), t.get(@intCast(i)));
-    try std.testing.expectEqual(@as(?u32, null), t.get(5000));
+/// Insert keys in the given order, validating after every put, then check every value.
+fn fillAndCheck(keys: []const u32) !void {
+    var t: Tree = .empty;
+    defer t.deinit(testing.allocator);
+    for (keys) |k| {
+        try t.put(testing.allocator, k, k * 10);
+        try t.validate();
+    }
+    try testing.expectEqual(keys.len, t.count());
+    for (keys) |k| try testing.expectEqual(@as(?u32, k * 10), t.get(k));
+}
+
+test "empty tree" {
+    var t: Tree = .empty;
+    defer t.deinit(testing.allocator);
+    try testing.expectEqual(@as(?u32, null), t.get(1));
+    try testing.expect(!t.contains(1));
+    try testing.expectEqual(@as(usize, 0), t.count());
+    try t.validate();
+}
+
+test "ascending inserts" {
+    var keys: [500]u32 = undefined;
+    for (&keys, 0..) |*k, i| k.* = @intCast(i);
+    try fillAndCheck(&keys);
+}
+
+test "descending inserts" {
+    var keys: [500]u32 = undefined;
+    for (&keys, 0..) |*k, i| k.* = @intCast(keys.len - i);
+    try fillAndCheck(&keys);
+}
+
+test "shuffled inserts" {
+    var keys: [500]u32 = undefined;
+    for (&keys, 0..) |*k, i| k.* = @intCast(i);
+    var prng = std.Random.DefaultPrng.init(0xb7ee);
+    prng.random().shuffle(u32, &keys);
+    try fillAndCheck(&keys);
+}
+
+test "overwrite keeps count" {
+    var t: Tree = .empty;
+    defer t.deinit(testing.allocator);
+    for (0..100) |i| try t.put(testing.allocator, @intCast(i), 1);
+    for (0..100) |i| try t.put(testing.allocator, @intCast(i), 2);
+    try t.validate();
+    try testing.expectEqual(@as(usize, 100), t.count());
+    for (0..100) |i| try testing.expectEqual(@as(?u32, 2), t.get(@intCast(i)));
+}
+
+test "missing keys return null" {
+    var t: Tree = .empty;
+    defer t.deinit(testing.allocator);
+    for (0..100) |i| try t.put(testing.allocator, @intCast(i * 2), 0); // evens only
+    for (0..100) |i| try testing.expect(!t.contains(@intCast(i * 2 + 1))); // odds absent
 }
